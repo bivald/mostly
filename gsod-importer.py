@@ -1,4 +1,4 @@
-import httplib, os, sqlite3, sys, urllib, logging, datetime, csv, tarfile, gzip #, geohash
+import httplib, os, psycopg2, sys, urllib, logging, datetime, csv, tarfile, gzip #, geohash
 
 _DBCONN = None
 logger = logging.getLogger('gdd')
@@ -8,21 +8,35 @@ ch.setLevel(logging.DEBUG)
 logger.addHandler(ch)
 
 def setup_environment():
-    temperature_db = 'mostly.db'
-    if not os.path.exists(temperature_db):
-        logger.debug('creating mostly.db')
-        create_temperature_database(temperature_db)
+    
+    #conn = psycopg2.connect("dbname=mostly user=postgres")
+    conn = psycopg2.connect(
+      database="mostly",
+      user="postgres",
+      host="localhost",
+      password=""
+    )
+    
     global _DBCONN
-    _DBCONN = sqlite3.connect(temperature_db)
+    _DBCONN = conn
 
-def create_temperature_database (path):
+    cur  = conn.cursor()
+    cur.execute("select exists(select * from information_schema.tables where table_name=%s)", ('stations',))
+    if not cur.fetchone()[0]:
+        create_temperature_database()
+
+   
+
+def create_temperature_database ():
     '''Create an sqlite database for storing temperature station data. Load the station
 id and location information from the Global Historical Climate Network's data inventory file'''
     logger.debug('creating database: stations and readings')
-    db_conn = sqlite3.connect(path)
-    db_cursor = db_conn.cursor()
-    db_cursor.execute('CREATE TABLE stations ("ID" VARCHAR(12) NOT NULL, "USAF" VARCHAR(6) NOT NULL, "WBAN" VARCHAR(5) NOT NULL, "NAME", "CTRY", "FIPS", "STATE", "CALL", "LAT" NOT NULL, "LON" NOT NULL, "GEOHASH", "ELEV", "BEGIN" VARCHAR(8), "END" VARCHAR(8), PRIMARY KEY (ID));')
-    db_cursor.execute('CREATE TABLE readings ("ID" VARCHAR(12) NOT NULL, "USAF" VARCHAR(6) NOT NULL, "WBAN" VARCHAR(5) NOT NULL, "YEARMODA" INT(8) NOT NULL, "TEMP" REAL(6) NOT NULL, "DEWP" REAL(6) NOT NULL, "SLP" REAL(6) NOT NULL, "STP" REAL(6) NOT NULL, "VISIB" REAL(5) NOT NULL, "WDSP" REAL(5) NOT NULL, "MXSPD" REAL(5) NOT NULL, "GUST" REAL(5) NOT NULL, "MAX" REAL(6) NOT NULL, "MIN" REAL(6) NOT NULL, "PRCP" REAL(5) NOT NULL, "PRCP_FLAG" VARCHAR(1), "SNDP"  REAL(5) NOT NULL, "FRSHTT");')
+
+    db_conn = _DBCONN
+    db_cursor = _DBCONN.cursor()
+    db_cursor.execute('CREATE TABLE stations (ID VARCHAR(12) NOT NULL, USAF VARCHAR(8) NOT NULL, WBAN VARCHAR(5) NOT NULL, NAME varchar(60), CTRY varchar(2), FIPS varchar(2), STATE varchar(2), CALL varchar(6), LAT varchar(8) NOT NULL, LON varchar(8) NOT NULL, ELEV INT, BEGINDATE DATE, ENDDATE DATE);')
+    db_cursor.execute("SELECT AddGeometryColumn('', 'stations','position',-1,'POINT',2);")
+    db_cursor.execute('CREATE TABLE readings (ID VARCHAR(12) NOT NULL, USAF VARCHAR(8) NOT NULL, WBAN VARCHAR(5) NOT NULL, YEARMODA DATE NOT NULL, TEMP real NOT NULL, DEWP REAL NOT NULL, SLP REAL NOT NULL, STP REAL NOT NULL, VISIB REAL NOT NULL, WDSP REAL NOT NULL, MXSPD REAL NOT NULL, GUST REAL NOT NULL, MAX REAL NOT NULL, MIN REAL NOT NULL, PRCP REAL NOT NULL, PRCP_FLAG VARCHAR(1), SNDP  REAL NOT NULL, FRSHTT VARCHAR(5));')
 
     db_conn.commit()
     current_year = datetime.datetime.now().year
@@ -50,7 +64,7 @@ id and location information from the Global Historical Climate Network's data in
     stations = []
     logger.debug('loading station data from ncdc.noaa.gov')
     #response = http_get('www1.ncdc.noaa.gov', 80, '/pub/data/gsod/ish-history.csv')
-    response = http_get('localhost', 8888, '/ish-history.csv')
+    response = http_get('localhost', 80, '/ish-history.csv')
     _response = response.split('\n')
     _response = _response[1:] # Remove first line with the CSV headers
     _stations = csv.reader(_response, delimiter=',', quotechar='"')
@@ -80,16 +94,26 @@ id and location information from the Global Historical Climate Network's data in
 
         if LAT == '-99999' or LON == '-99999' or BEGIN == 'NO DATA' or CTRY == '':
             continue
+
         if ELEV == '-99999':
             ELEV = None
 
         if LAT == '+00000' and LON == '+00000':
             continue
 
-        stations.append((ID,USAF,WBAN,NAME,CTRY,FIPS,STATE,CALL,LAT,LON,ELEV,BEGIN,END))
+        if BEGIN == '' or END == '':
+            continue
+
+        if LAT == '' or LON == '':
+            continue;
+
+        if ELEV == '':
+            ELEV = None
+
+        stations.append((ID,USAF,WBAN,NAME,CTRY,FIPS,STATE,CALL,LAT,LON,ELEV,BEGIN,END,LAT,LON))
 
     logger.debug('loaded %s stations into DB' % len(stations))
-    db_cursor.executemany('INSERT INTO stations (ID,USAF,WBAN,NAME,CTRY,FIPS,STATE,CALL,LAT,LON,ELEV,"BEGIN",END) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', stations)
+    db_cursor.executemany('INSERT INTO stations (ID,USAF,WBAN,NAME,CTRY,FIPS,STATE,CALL,LAT,LON,ELEV,BEGINDATE,ENDDATE,POSITION) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, ST_MakePoint(%s,%s))', stations)
     db_conn.commit()
     db_cursor.close()
 
@@ -99,11 +123,18 @@ id and location information from the Global Historical Climate Network's data in
     
     #logger.debug('reading data from file %s' %path)
     db_conn = _DBCONN
+
+    db_cursor = _DBCONN.cursor()
+    db_cursor.execute("ALTER stations ADD COLUMN %s bool" % year)
+    db_conn.commit()
+
     db_cursor = db_conn.cursor()
-        
+
     readings = []
     _response = gzip.open(path, 'rb').readlines()
     _response = _response[1:] # Remove first line with the headers
+
+    _stations_years_added = []
 
     for l in _response:
        USAF = l[0:6].strip(' \t\n\r')
@@ -133,6 +164,12 @@ id and location information from the Global Historical Climate Network's data in
 
        if MIN == '9999.9' or MIN == 9999.9:
             continue
+
+        if ID not in _stations_years_added:
+            # Alter column, set %year to 1
+            # UPDATE stations SET %year = 1 where ID = %id
+            _stations_years_added[ID] = True
+
 
        readings.append((ID,USAF,WBAN,YEARMODA,TEMP,DEWP,SLP,STP,VISIB,WDSP,MXSPD,GUST,MAX,MIN,PRCP,PRCP_FLAG,SNDP,FRSHTT))
 
